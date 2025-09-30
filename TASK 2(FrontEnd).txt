@@ -1,0 +1,19 @@
+import React from 'react';
+import { BrowserRouter, Routes, Route, Link } from 'react-router-dom';
+import Jobs from './pages/Jobs';
+import Apply from './pages/Apply';
+import Employer from './pages/Employer';
+import Analytics from './pages/Analytics';
+export default function App(){
+  return (
+    <BrowserRouter>
+      <nav><Link to="/">Jobs</Link> | <Link to="/employer">Employer</Link> | <Link to="/analytics">Analytics</Link></nav>
+      <Routes>
+        <Route path="/" element={<Jobs/>} />
+        <Route path="/apply/:id" element={<Apply/>} />
+        <Route path="/employer" element={<Employer/>} />
+        <Route path="/analytics" element={<Analytics/>} />
+      </Routes>
+    </BrowserRouter>
+  );
+}

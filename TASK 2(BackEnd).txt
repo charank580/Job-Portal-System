@@ -1,0 +1,202 @@
+require('dotenv').config();
+const express = require('express');
+const mongoose = require('mongoose');
+const cors = require('cors');
+const multer = require('multer');
+const fs = require('fs');
+const axios = require('axios');
+
+const app = express();
+app.use(express.json());
+app.use(cors({ origin: process.env.CLIENT_URL || '*' }));
+
+// DB
+mongoose.connect(process.env.MONGO_URI);
+
+// Simple models
+const UserSchema = new mongoose.Schema({
+  name: String,
+  email: String,
+  role: { type: String, enum: ['candidate','employer','admin'], default: 'candidate' },
+  password: String, // hashed in real app
+  resumeUrl: String,
+  skills: [String],
+  company: String
+}, { timestamps: true });
+const JobSchema = new mongoose.Schema({
+  employer: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  title: String,
+  description: String,
+  location: String,
+  tags: [String],
+  active: { type: Boolean, default: true }
+}, { timestamps: true });
+const ApplicationSchema = new mongoose.Schema({
+  job: { type: mongoose.Schema.Types.ObjectId, ref: 'Job' },
+  candidate: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  resumeText: String,
+  matchedSkills: [String],
+  status: { type: String, enum: ['applied','shortlisted','rejected'], default: 'applied' }
+}, { timestamps: true });
+
+const User = mongoose.model('User', UserSchema);
+const Job = mongoose.model('Job', JobSchema);
+const Application = mongoose.model('Application', ApplicationSchema);
+
+// Minimal auth helpers (NOT production secure)
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const auth = async (req,res,next) => {
+  const token = req.header('Authorization')?.replace('Bearer ','');
+  if(!token) return res.status(401).send({msg:'No token'});
+  try {
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = await User.findById(payload.id);
+    next();
+  } catch(e) { res.status(401).send({msg:'Invalid token'}); }
+};
+
+// Routes
+
+// Register (candidate or employer)
+app.post('/api/auth/register', async (req,res)=>{
+  const { name,email,password,role,company } = req.body;
+  if(await User.findOne({ email })) return res.status(400).send({msg:'Email exists'});
+  const hashed = await bcrypt.hash(password,10);
+  const u = new User({ name,email,password:hashed,role,company });
+  await u.save();
+  const token = jwt.sign({ id: u._id }, process.env.JWT_SECRET);
+  res.json({ token, user: { id:u._id, name:u.name, role:u.role } });
+});
+
+// Login
+app.post('/api/auth/login', async (req,res)=>{
+  const { email,password } = req.body;
+  const u = await User.findOne({ email });
+  if(!u) return res.status(400).send({msg:'Invalid'});
+  const ok = await bcrypt.compare(password, u.password);
+  if(!ok) return res.status(400).send({msg:'Invalid'});
+  const token = jwt.sign({ id:u._id }, process.env.JWT_SECRET);
+  res.json({ token, user: { id:u._id, name:u.name, role:u.role } });
+});
+
+/*
+ LinkedIn OAuth stub:
+ 1) /api/auth/linkedin -> redirect to linkedin authorize url
+ 2) /api/auth/linkedin/callback -> exchange code for access token, fetch profile and return data
+ Fill LINKEDIN_CLIENT_ID/SECRET in .env and set redirect URI accordingly.
+*/
+app.get('/api/auth/linkedin', (req,res) => {
+  const params = new URLSearchParams({
+    response_type: 'code',
+    client_id: process.env.LINKEDIN_CLIENT_ID,
+    redirect_uri: process.env.LINKEDIN_REDIRECT_URI,
+    scope: 'r_liteprofile r_emailaddress'
+  });
+  const url = `https://www.linkedin.com/oauth/v2/authorization?${params.toString()}`;
+  res.redirect(url);
+});
+
+app.get('/api/auth/linkedin/callback', async (req,res) => {
+  const code = req.query.code;
+  if(!code) return res.status(400).send('No code');
+  try {
+    // exchange code for access token
+    const tokenRes = await axios.post('https://www.linkedin.com/oauth/v2/accessToken', null, {
+      params: {
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: process.env.LINKEDIN_REDIRECT_URI,
+        client_id: process.env.LINKEDIN_CLIENT_ID,
+        client_secret: process.env.LINKEDIN_CLIENT_SECRET
+      }
+    });
+    const accessToken = tokenRes.data.access_token;
+    // fetch basic profile
+    const profileRes = await axios.get('https://api.linkedin.com/v2/me', { headers: { Authorization: `Bearer ${accessToken}` }});
+    const emailRes = await axios.get('https://api.linkedin.com/v2/emailAddress?q=members&projection=(elements*(handle~))', { headers: { Authorization: `Bearer ${accessToken}` }});
+    // return a simple JSON (frontend should capture and process)
+    res.json({ profile: profileRes.data, email: emailRes.data });
+  } catch(err) { console.error(err.response?.data||err.message); res.status(500).send('LinkedIn error'); }
+});
+
+// Employer: create job
+app.post('/api/jobs', auth, async (req,res)=>{
+  if(req.user.role !== 'employer') return res.status(403).send({msg:'Only employers'});
+  const j = new Job({ employer: req.user._id, title: req.body.title, description: req.body.description, location: req.body.location, tags: req.body.tags || [] });
+  await j.save();
+  res.json(j);
+});
+
+// List jobs (public)
+app.get('/api/jobs', async (req,res)=>{
+  const jobs = await Job.find({ active:true }).sort({ createdAt:-1 }).limit(100).populate('employer','name company');
+  res.json(jobs);
+});
+
+// Admin: deactivate job
+app.post('/api/admin/jobs/:id/deactivate', auth, async (req,res)=>{
+  if(req.user.role !== 'admin') return res.status(403).send({msg:'Admin only'});
+  const j = await Job.findById(req.params.id);
+  if(!j) return res.status(404).send({msg:'Not found'});
+  j.active = false;
+  await j.save();
+  res.json({msg:'deactivated'});
+});
+
+// Resume upload + parsing + apply
+const upload = multer({ dest: './tmp' });
+app.post('/api/jobs/:id/apply', auth, upload.single('resume'), async (req,res)=>{
+  if(req.user.role !== 'candidate') return res.status(403).send({msg:'Only candidates'});
+  const job = await Job.findById(req.params.id);
+  if(!job) return res.status(404).send({msg:'Job not found'});
+
+  // read resume file (plain text or small pdf -> we'll treat as text for prototype)
+  let text = '';
+  if(req.file) {
+    text = fs.readFileSync(req.file.path, 'utf8'); // NOTE: in real app extract from PDF/DOCX using libraries
+    fs.unlinkSync(req.file.path);
+  } else if (req.body.resumeText) {
+    text = req.body.resumeText;
+  }
+
+  // simple parsing: extract lowercase words and unique tokens as skills
+  const tokens = Array.from(new Set((text.toLowerCase().match(/\b[a-zA-Z0-9\+#\.\-]+\b/g)||[]).slice(0,500)));
+  // job matching: count overlap between tokens and job.tags/title/desc words
+  const jobWords = (job.title + ' ' + job.description + ' ' + (job.tags||[]).join(' ')).toLowerCase().match(/\b[a-zA-Z0-9\+#\.\-]+\b/g) || [];
+  const matched = jobWords.filter(w => tokens.includes(w));
+  const matchedUnique = Array.from(new Set(matched)).slice(0,20);
+
+  const appDoc = new Application({ job: job._id, candidate: req.user._id, resumeText: text.slice(0,20000), matchedSkills: matchedUnique });
+  await appDoc.save();
+
+  res.json({ msg: 'applied', matchedSkills: matchedUnique });
+});
+
+// Candidate: view applications
+app.get('/api/me/applications', auth, async (req,res)=>{
+  if(req.user.role !== 'candidate') return res.status(403).send({msg:'Only candidates'});
+  const apps = await Application.find({ candidate: req.user._id }).populate('job');
+  res.json(apps);
+});
+
+// Employer: view applicants for a job
+app.get('/api/employer/jobs/:id/applications', auth, async (req,res)=>{
+  if(req.user.role !== 'employer') return res.status(403).send({msg:'Only employers'});
+  const job = await Job.findById(req.params.id);
+  if(!job) return res.status(404).send({msg:'Not found'});
+  if(!job.employer.equals(req.user._id)) return res.status(403).send({msg:'Not owner'});
+  const apps = await Application.find({ job: job._id }).populate('candidate','name email skills');
+  res.json(apps);
+});
+
+// Basic analytics for dashboards
+app.get('/api/admin/analytics', auth, async (req,res)=>{
+  if(req.user.role !== 'admin') return res.status(403).send({msg:'Admin only'});
+  const totalJobs = await Job.countDocuments();
+  const totalUsers = await User.countDocuments();
+  const totalApps = await Application.countDocuments();
+  res.json({ totalJobs, totalUsers, totalApps });
+});
+
+app.listen(process.env.PORT || 5000, ()=> console.log('Backend running'));
