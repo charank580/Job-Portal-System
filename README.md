@@ -44,3 +44,4 @@ In summary, this Job Portal System demonstrates the practical application of the
 
 # OUTPUT:
 
+<img width="1536" height="1024" alt="Image" src="https://github.com/user-attachments/assets/5cf38269-45e0-418b-bfe5-c171684688ed" />
