@@ -41,3 +41,6 @@ React.js powers the frontend, providing a dynamic interface for browsing jobs, a
 Node.js serves as the runtime environment for the backend logic, authentication, and LinkedIn API integration.
 
 In summary, this Job Portal System demonstrates the practical application of the MERN stack in building a modern recruitment platform. It covers crucial features such as multi-role dashboards, resume parsing, job matching, and API integration, making it a complete prototype for real-world job portals.
+
+# OUTPUT:
+
